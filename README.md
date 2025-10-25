@@ -13,9 +13,15 @@ Watches every message, converts links from common social sites to cleaner mirror
 * Resolves Instagram /share/* to canonical /p|/reel|/tv/... before mirroring
 
 ## Demo
-![Bot replacing pt1](docs/assets/InstaPost.mp4)
-![Bot replacing pt2](docs/assets/InstaVideo.mp4)
-![Bot replacing pt3](docs/assets/RedditPost.mp4)
+https://github.com/user-attachments/assets/a08744c2-5e67-4844-99a6-89147e299a36
+
+
+https://github.com/user-attachments/assets/cdda6e67-852a-4b55-a9f5-808339c6fcfb
+
+
+https://github.com/user-attachments/assets/237f2456-a0bf-469a-9891-78c495be8104
+
+
 
 ## Mirrors used
 
