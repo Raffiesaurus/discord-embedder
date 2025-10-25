@@ -58,7 +58,6 @@ DISCORD_TOKEN=your_bot_token
 * If the host is known, swap to the mirror. For Instagram: 
   * resolve /share/* to canonical
   * skip stories
-* Repost with masked labels. If you want the mirror to actually unfurl, put the bare mirror URL on a new line (Discord embeds only on bare links; masked links don’t auto-preview). See Discord’s Markdown guide for general formatting.
 
 ## Notes / limitations
 * Only public content embeds cleanly.
