@@ -12,6 +12,11 @@ Watches every message, converts links from common social sites to cleaner mirror
 * Carries over attachments
 * Resolves Instagram /share/* to canonical /p|/reel|/tv/... before mirroring
 
+## Demo
+![Bot replacing pt1](docs/assets/InstaPost.mp4)
+![Bot replacing pt2](docs/assets/InstaVideo.mp4)
+![Bot replacing pt3](docs/assets/RedditPost.mp4)
+
 ## Mirrors used
 
 * Twitter/X → fixupx.com
