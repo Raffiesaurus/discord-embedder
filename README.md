@@ -1,71 +1,83 @@
 # Discord Embedder
 
-Watches every message, converts links from common social sites to cleaner mirror URLs, reposts, and deletes the original. Attachments are preserved.
+A Discord bot that watches every message, rewrites links from social media sites to cleaner mirror URLs that actually embed in Discord, reposts with attribution, and deletes the original. Attachments are preserved throughout.
 
-> This is a private project I made for me and my friends. If you want to use it, please create your own Discord bot and run it on your own server.
+> ⚠️ This is a personal project built for a private server. It's not a hosted service - you'll need to run your own bot instance.
 
-## What it does
-
-* Detects links in any message
-* Rewrites to better-embed mirrors
-* Reposts with masked “Original” and “Embed” labels
-* Carries over attachments
-* Resolves Instagram /share/* to canonical /p|/reel|/tv/... before mirroring
+---
 
 ## Demo
-https://github.com/user-attachments/assets/a08744c2-5e67-4844-99a6-89147e299a36
 
+https://github.com/user-attachments/assets/a08744c2-5e67-4844-99a6-89147e299a36
 
 https://github.com/user-attachments/assets/cdda6e67-852a-4b55-a9f5-808339c6fcfb
 
-
 https://github.com/user-attachments/assets/237f2456-a0bf-469a-9891-78c495be8104
 
+---
 
+## How It Works
 
-## Mirrors used
+1. Bot detects a URL in any message
+2. Rewrites the host to a known embed-friendly mirror
+3. Reposts the message with **Original** and **Embed** labels
+4. Deletes the original message
+5. Attachments from the original are carried over
 
-* Twitter/X → fixupx.com
-* Instagram → kkinstagram.com
-* Reddit → rxddit.com
-* TikTok → vxtiktok.com
-* Bluesky → bskx.app
+Instagram `/share/*` links are resolved to canonical `/p/`, `/reel/`, or `/tv/` paths before mirroring. Instagram Stories are skipped.
 
-You can edit the map in DEFAULT_MIRRORS inside bot.py.
+---
 
-## Requirements
-* Python 3.10+
-* A Discord bot token in .env as DISCORD_TOKEN=...
-* Message Content intent enabled for your app in the Developer Portal and in code (intents.message_content = True). 
+## Supported Sites
 
-## Setup (self-host)
+| Platform | Mirror |
+|----------|--------|
+| Twitter / X | `fixupx.com` |
+| Instagram | `kkinstagram.com` |
+| Reddit | `rxddit.com` |
+| TikTok | `vxtiktok.com` |
+| Bluesky | `bskx.app` |
 
-This repo is not a hosted service. If you want to use it, make your own bot and run it yourself.
+To add or change mirrors, edit the `DEFAULT_MIRRORS` map in `bot.py`.
 
-* Create a Discord application and bot, then get your token. 
-* Enable the Message Content privileged intent for the app. 
-* Clone the repo, create a virtualenv, install deps, and set your .env:
+---
 
-## Configuration
-.env
+## Setup
+
+### Requirements
+
+- Python 3.10+
+- A Discord bot token with **Message Content** privileged intent enabled
+
+### Steps
+
+1. Create a Discord application and bot at the [Developer Portal](https://discord.com/developers/applications)
+2. Enable the **Message Content** privileged intent
+3. Clone the repo and install dependencies:
+   ```bash
+   git clone https://github.com/Raffiesaurus/discord-embedder.git
+   cd discord-embedder
+   pip install -r requirements.txt
+   ```
+4. Create a `.env` file:
 ```
-DISCORD_TOKEN=your_bot_token
+DISCORD_TOKEN=your_bot_token_here
+```
+5. Run the bot:
+```bash
+python bot.py
 ```
 
-## How it works
+---
 
-* Regex finds URLs in the message.
-* If the host is known, swap to the mirror. For Instagram: 
-  * resolve /share/* to canonical
-  * skip stories
+## Notes
 
-## Notes / limitations
-* Only public content embeds cleanly.
-* If a site changes its markup or blocks fetching, the bot still posts the mirrored link.
-* This project doesn’t store messages; it just reads, rewrites, and reposts.
+- Only publicly embeddable content will render as a preview
+- The bot does not store any message content - it reads, rewrites, and reposts only
+- If a mirror site changes its behaviour, the bot will still post the rewritten link - it just may not embed
 
-## Contributing
-No public support. Fork it and make your own tweaks.
+---
 
 ## License
-Personal project. If you fork, add your own license file.
+
+Personal project - no public support. Fork freely and add your own license.
