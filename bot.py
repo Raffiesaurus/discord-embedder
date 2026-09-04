@@ -1,389 +1,503 @@
 ﻿"""
 Discord link-rewriter bot.
 
-Listens to every message in allowed guilds, finds known social links, rewrites
-them to mirror domains with better embeds, reposts, and deletes the original.
-- Instagram “share” URLs are resolved to canonical /p|/reel|/tv before mirroring.
-- Any attachments are preserved.
-- Mentions are suppressed via AllowedMentions.none() to avoid pings.
+Watches guild messages, rewrites known social URLs to embed-friendly mirrors,
+and re-posts the same text via a webhook so it still looks like the original
+author. Discord cannot edit another user's message; webhook impersonation is
+the supported substitute.
 
-Operational notes:
-- Requires the Message Content intent in the Developer Portal and in code.
-- Bot needs Manage Messages in target channels to delete originals.
+Requires the Message Content intent, plus Manage Messages and Manage Webhooks
+in target channels.
 """
 
+from __future__ import annotations
+
+import asyncio
+import logging
 import os
 import re
-import json
-from typing import Optional, Tuple, List
-from urllib.parse import urlparse, urlunparse
+import sys
+from collections import OrderedDict
+from typing import Dict, List, Optional, Sequence, Tuple
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
+import aiohttp
 import discord
 from dotenv import load_dotenv
-import aiohttp
-from bs4 import BeautifulSoup
 
-# ---- Bootstrapping -----------------------------------------------------------
-
-load_dotenv()
-TOKEN = os.getenv("DISCORD_TOKEN")
-
-intents = discord.Intents.default()
-intents.message_content = True
-client = discord.Client(intents=intents)
+log = logging.getLogger("embedder")
 
 # ---- Rewriting configuration -------------------------------------------------
 
-# Map origin hosts → mirrors with nicer embeds/cards.
-DEFAULT_MIRRORS = {
+DEFAULT_MIRRORS: Dict[str, str] = {
     "twitter.com": "fixupx.com",
     "x.com": "fixupx.com",
-
-    "instagram.com": "kkinstagram.com",
-
-    "reddit.com": "rxddit.com",
-
+    "instagram.com": "oginstagram.com",
+    "reddit.com": "vxreddit.com",
     "tiktok.com": "vxtiktok.com",
-
     "bsky.app": "bskx.app",
 }
 
 SKIP_HOSTS = {
-    "fxtwitter.com", "fixupx.com",
-    "kkinstagram.com", "uuinstagram.com", "instagramez.com",
-    "rxddit.com", "vxreddit.com",
+    "fxtwitter.com",
+    "fixupx.com",
+    "kkinstagram.com",
+    "uuinstagram.com",
+    "instagramez.com",
+    "oginstagram.com",
+    "vxreddit.com",
+    "rxeddit.com",
     "vxtiktok.com",
-    "bskx.app", "bskyx.app",
+    "bskx.app",
+    "bskyx.app",
 }
+
+TIKTOK_SHORT_HOSTS = {"vm.tiktok.com", "vt.tiktok.com"}
 
 # Bare-bones URL matcher that avoids trailing punctuation that breaks embeds.
 URL_RE = re.compile(r"https?://[^\s<]+[^<.,:;\"')\]\s]")
 
-# Lazily created HTTP session for all outbound fetches.
-session: Optional[aiohttp.ClientSession] = None
+# /p, /reel, /reels, /tv (optionally under a username) and /stories/.
+# /share/* is excluded — those must be HTTP-resolved first.
+IG_EMBEDDABLE_PATH = re.compile(
+    r"^/(?!share/)(?:(?:[^/]+/)?(?:p|reel|reels|tv)/|stories/)",
+    re.IGNORECASE,
+)
 
-# IG canonical paths we know how to mirror. Stories are intentionally skipped.
-SUPPORTED_IG_POST_PREFIXES = ("/reel/", "/p/", "/tv/")
-STORY_PREFIX = "/stories/"
+TRACKING_QUERY_EXACT = {
+    "igsh",
+    "igshid",
+    "fbclid",
+    "gclid",
+    "mc_cid",
+    "mc_eid",
+    "si",
+    "feature",
+    "refsrc",
+    "ref_src",
+    "ref",
+    "mbid",
+    "src",
+    "s",
+    "t",
+}
 
-# ---- HTTP/session helpers ----------------------------------------------------
+WEBHOOK_NAME = "Embedder"
+HTTP_TIMEOUT = aiohttp.ClientTimeout(total=8)
+BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Safari/537.36"
+)
+MAX_SEEN = 4000
+MAX_FILES = 10
 
-async def _get_session() -> aiohttp.ClientSession:
-    """Create a shared aiohttp session with a sane total timeout."""
-    global session
-    if session is None or session.closed:
-        session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8))
-    return session
 
-# ---- Domain routing ----------------------------------------------------------
+# ---- Pure rewrite helpers (unit-tested) --------------------------------------
 
-def _pick_source(host: str) -> Optional[str]:
-    """Normalise host to a known source key used in DEFAULT_MIRRORS."""
-    h = host.lower()
-    if h.endswith("twitter.com") or h.endswith("x.com"): return "x.com"
-    if h.endswith("instagram.com"): return "instagram.com"
-    if h.endswith("reddit.com"): return "reddit.com"
-    if h.endswith("tiktok.com"): return "tiktok.com"
-    if h.endswith("bsky.app"): return "bsky.app"
+def normalize_host(host: Optional[str]) -> str:
+    """Lowercase hostname without a leading www."""
+    h = (host or "").lower()
+    if h.startswith("www."):
+        h = h[4:]
+    return h
+
+
+def is_skipped_host(host: Optional[str]) -> bool:
+    h = normalize_host(host)
+    if not h:
+        return True
+    if h in SKIP_HOSTS:
+        return True
+    return any(h.endswith("." + skipped) for skipped in SKIP_HOSTS)
+
+
+def pick_source(host: Optional[str]) -> Optional[str]:
+    """Map a hostname to a DEFAULT_MIRRORS key, or None if unknown."""
+    h = normalize_host(host)
+    if not h or is_skipped_host(h):
+        return None
+    if h == "twitter.com" or h.endswith(".twitter.com"):
+        return "twitter.com"
+    if h == "x.com" or h.endswith(".x.com"):
+        return "x.com"
+    if h == "instagram.com" or h.endswith(".instagram.com"):
+        return "instagram.com"
+    if h == "reddit.com" or h.endswith(".reddit.com"):
+        return "reddit.com"
+    if h == "tiktok.com" or h.endswith(".tiktok.com"):
+        return "tiktok.com"
+    if h == "bsky.app" or h.endswith(".bsky.app"):
+        return "bsky.app"
     return None
 
-# ---- Instagram plumbing ------------------------------------------------------
 
-async def _resolve_instagram_share(url: str) -> Optional[str]:
+def is_instagram_embeddable(path: str) -> bool:
+    return bool(IG_EMBEDDABLE_PATH.match(path or ""))
+
+
+def needs_resolve(url: str) -> bool:
+    """True when the URL must be followed before a mirror host can be chosen."""
+    parsed = urlparse(url)
+    host = normalize_host(parsed.hostname)
+    if host == "instagram.com" or host.endswith(".instagram.com"):
+        return parsed.path.startswith("/share/")
+    return host in TIKTOK_SHORT_HOSTS
+
+
+def strip_tracking(url: str) -> str:
+    """Drop common share/analytics query params and fragments."""
+    parsed = urlparse(url)
+    if not parsed.query:
+        return urlunparse(parsed._replace(fragment=""))
+    kept = [
+        (key, value)
+        for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+        if key.lower() not in TRACKING_QUERY_EXACT
+        and not key.lower().startswith("utm_")
+    ]
+    return urlunparse(parsed._replace(query=urlencode(kept), fragment=""))
+
+
+def rewrite_resolved(url: str) -> Optional[str]:
     """
-    Follow redirects for instagram.com/share/* to a canonical post URL.
-    HEAD first (cheap), then GET as a fallback.
+    Swap a fully-resolved social URL onto its mirror host.
+    Returns None when the URL should be left alone.
     """
-    sess = await _get_session()
-    headers = {"User-Agent": "curl/8"}
-    try:
-        async with sess.head(url, allow_redirects=True, headers=headers) as resp:
-            return str(resp.url)
-    except Exception:
-        pass
-    try:
-        async with sess.get(url, allow_redirects=True, headers=headers) as resp:
-            return str(resp.url)
-    except Exception:
+    parsed = urlparse(url)
+    host = parsed.hostname
+    if is_skipped_host(host):
         return None
 
-async def _rewrite_instagram(url: str) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Resolve /share/* to canonical, skip stories, and mirror canonical posts.
-    Returns (mirror_url, canonical_ig_url). The canonical is used by enrichment paths.
-    """
-    p = urlparse(url)
-    canonical = url
+    source = pick_source(host)
+    if not source:
+        return None
 
-    # Resolve short-lived share links to stable canonical URLs.
-    if p.path.startswith("/share/"):
-        final = await _resolve_instagram_share(url)
-        if not final:
-            return None, None
-        canonical = final
-        p = urlparse(final)
+    if source == "instagram.com" and not is_instagram_embeddable(parsed.path):
+        return None
 
-    # Stories are ephemeral and mirrors are inconsistent → let them pass untouched.
-    if p.path.startswith(STORY_PREFIX):
-        return None, canonical
+    mirror = DEFAULT_MIRRORS.get(source)
+    if not mirror:
+        return None
 
-    # Mirror canonical post types only.
-    if p.path.startswith(SUPPORTED_IG_POST_PREFIXES):
-        mirror = DEFAULT_MIRRORS.get("instagram.com")
-        if not mirror:
-            return None, canonical
-        return urlunparse(p._replace(netloc=mirror)), canonical
+    cleaned = urlparse(strip_tracking(url))
+    new_url = urlunparse(
+        cleaned._replace(scheme="https", netloc=mirror)
+    )
+    return new_url if new_url != url else None
 
-    # Unknown IG path, do nothing but hand back canonical for potential future use.
-    return None, canonical
 
-# ---- Generic rewrite ---------------------------------------------------------
-
-async def _rewrite_one(url: str) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Core rewrite:
-    - Skip already-mirrored hosts.
-    - Instagram: resolve share → canonical and mirror.
-    - Other known hosts: swap netloc to mirror.
-    Returns (mirror_url, canonical_ig_url|None).
-    """
-    try:
-        p = urlparse(url)
-        host = (p.hostname or "").lower()
-        if not host or host in SKIP_HOSTS:
-            return None, None
-
-        if host.endswith("instagram.com"):
-            return await _rewrite_instagram(url)
-
-        src = _pick_source(host)
-        if not src:
-            return None, None
-
-        mirror = DEFAULT_MIRRORS.get(src)
-        if not mirror:
-            return None, None
-
-        new_url = urlunparse(p._replace(netloc=mirror))
-        return (new_url if new_url != url else None), None
-    except Exception:
-        # Quiet failure: don't break message flow for a single bad URL.
-        return None, None
-
-# ---- Text helpers ------------------------------------------------------------
-
-def _strip_links_from_text(text: str, links: List[str]) -> str:
-    """Remove found URLs from the user's message; collapse whitespace."""
+def apply_rewrites(text: str, replacements: Sequence[Tuple[str, str]]) -> str:
+    """Replace original URLs with mirrors, longest match first."""
     out = text
-    for l in links:
-        out = out.replace(l, "")
-    return " ".join(out.split()).strip()
-
-def _compact_ws(s: str) -> str:
-    """Normalise whitespace in scraped strings."""
-    return re.sub(r"\s+", " ", s or "").strip()
-
-def _truncate(s: str, max_len: int = 600) -> str:
-    """Hard cap long captions to keep reposts tidy."""
-    s = s or ""
-    return s if len(s) <= max_len else s[: max_len - 1] + "…"
-
-# ---- IG enrichment does not work :( ------------
-
-def _parse_ig_from_og(og_title: Optional[str], og_desc: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
-    author = None
-    caption = None
-
-    if og_title:
-        m = re.match(r'^(.+?)\s+on Instagram:?\s*["“](.*?)["”]?\s*$', og_title.strip())
-        if m:
-            author = _compact_ws(m.group(1))
-            caption = _compact_ws(m.group(2))
-
-    if og_desc:
-        caption = _compact_ws(og_desc)
-
-    return author, caption
-
-def _extract_og_twitter_meta(html: str) -> Tuple[Optional[str], Optional[str]]:
-    soup = BeautifulSoup(html, "html.parser")
-
-    def meta(prop: str, attr: str = "property") -> Optional[str]:
-        tag = soup.find("meta", attrs={attr: prop})
-        return tag.get("content") if tag and tag.get("content") else None
-
-    og_title = meta("og:title")
-    og_desc  = meta("og:description")
-    if not og_title:
-        tw_title = soup.find("meta", attrs={"name": "twitter:title"})
-        if tw_title and tw_title.get("content"):
-            og_title = tw_title.get("content")
-    if not og_desc:
-        tw_desc = soup.find("meta", attrs={"name": "twitter:description"})
-        if tw_desc and tw_desc.get("content"):
-            og_desc = tw_desc.get("content")
-
-    author, caption = _parse_ig_from_og(og_title, og_desc)
-
-    if not (author and caption):
-        for script in soup.find_all("script", attrs={"type": "application/ld+json"}):
-            try:
-                data = json.loads(script.text)
-                items = data if isinstance(data, list) else [data]
-                for d in items:
-                    if not isinstance(d, dict):
-                        continue
-                    if not author:
-                        a = d.get("author")
-                        if isinstance(a, dict):
-                            author = a.get("name") or a.get("alternateName")
-                        elif isinstance(a, list) and a and isinstance(a[0], dict):
-                            author = a[0].get("name")
-                    if not caption:
-                        caption = d.get("caption") or d.get("description") or d.get("articleBody")
-            except Exception:
-                continue
-
-    author = _compact_ws(author) if author else None
-    caption = _truncate(_compact_ws(caption)) if caption else None
-    return author, caption
+    for original, mirror in sorted(replacements, key=lambda pair: len(pair[0]), reverse=True):
+        out = out.replace(original, mirror)
+    return out
 
 
-async def _fetch_text(url: str, *, for_ig: bool = False) -> Optional[str]:
-    try:
-        sess = await _get_session()
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                          "AppleWebKit/537.36 (KHTML, like Gecko) "
-                          "Chrome/120.0.0.0 Safari/537.36"
-        }
-        async with sess.get(url, headers=headers, allow_redirects=True) as resp:
-            if 200 <= resp.status < 300:
-                return await resp.text(errors="ignore")
-    except Exception:
+def parse_allowed_guilds(raw: Optional[str]) -> Optional[set[int]]:
+    text = (raw or "").strip()
+    if not text:
         return None
-    return None
-
-async def _ig_from_canonical(canonical_ig_url: str) -> Tuple[Optional[str], Optional[str]]:
-    html = await _fetch_text(canonical_ig_url, for_ig=True)
-    if not html:
-        return None, None
-    return _extract_og_twitter_meta(html)
-
-async def _ig_from_mirror(mirror_url: str) -> Tuple[Optional[str], Optional[str]]:
-    html = await _fetch_text(mirror_url)
-    if not html:
-        return None, None
-    return _extract_og_twitter_meta(html)
-
-async def _ig_author_caption(canonical_ig_url: Optional[str], mirror_url: str) -> Tuple[Optional[str], Optional[str]]:
-    if canonical_ig_url:
-        a, c = await _ig_from_canonical(canonical_ig_url)
-        if a or c:
-            return a, c
-    return await _ig_from_mirror(mirror_url)
-
-# ---- Repost formatting -------------------------------------------------------
-
-def _format_repost(author_mention: str,
-                   extra_text: Optional[str],
-                   blocks: List[Tuple[str, str, Optional[str], Optional[str]]]) -> str:
-    """
-    Build the repost text. Current formatting uses masked links for *both*
-    Original and Embed; masked links do not unfurl.
-    """
-    lines: List[str] = [extra_text]
-
-    lines.append(f"Sent by {author_mention}")
-    for orig, mirror, ig_author, ig_caption in blocks:
-        if ig_author or ig_caption:
-            if ig_author:
-                lines.append(f"**Author:** {ig_author}")
-            if ig_caption:
-                lines.append(f"**Caption:** {ig_caption}")
-        # Angle brackets around the original URL inside a masked link ensure no preview.
-        lines.append(f"[Original Link](<{orig}>) | [Embed Link]({mirror})")
-
-    return "\n".join(lines)
-
-# ---- Discord event handlers --------------------------------------------------
-
-@client.event
-async def on_ready():
-    print(f"Logged in as {client.user}")
-
-@client.event
-async def on_message(message: discord.Message):
-    """
-    Main loop:
-    - Ignore bots and non-whitelisted guilds.
-    - Extract URLs, rewrite what we can, enrich IG where possible.
-    - Repost with attachments, then delete the original.
-    """
-    if message.author.bot:
-        return
-
-    content = message.content or ""
-    found_links = URL_RE.findall(content)
-    if not found_links:
-        return
-
-    # Rewrite phase
-    triples: List[Tuple[str, str, Optional[str]]] = []
-    seen = set()
-    for link in found_links:
-        if link in seen:
+    ids: set[int] = set()
+    for part in text.split(","):
+        part = part.strip()
+        if not part:
             continue
-        seen.add(link)
-        mirror, canonical_ig = await _rewrite_one(link)
-        if mirror:
-            triples.append((link, mirror, canonical_ig))
+        ids.add(int(part))
+    return ids or None
 
-    if not triples:
-        return
 
-    # Preserve user text (minus raw URLs) and any attachments.
-    extra_text = _strip_links_from_text(content, found_links)
+# ---- HTTP resolve ------------------------------------------------------------
 
-    blocks: List[Tuple[str, str, Optional[str], Optional[str]]] = []
-    for orig, mirror, canonical_ig in triples:
-        host = (urlparse(orig).hostname or "").lower()
-        if host.endswith("instagram.com"):
-            a, c = await _ig_author_caption(canonical_ig, mirror)
-            blocks.append((orig, mirror, a, c))
-        else:
-            blocks.append((orig, mirror, None, None))
-
-    files = []
+async def resolve_redirect(session: aiohttp.ClientSession, url: str) -> Optional[str]:
+    headers = {"User-Agent": BROWSER_UA}
     try:
-        for a in message.attachments:
-            files.append(await a.to_file(spoiler=a.is_spoiler()))
+        async with session.head(url, allow_redirects=True, headers=headers) as resp:
+            final = str(resp.url)
+            if final:
+                return final
     except Exception:
-        files = []
-
-    # Post first (so the user still sees something if delete fails), then delete.
+        log.debug("HEAD resolve failed for %s", url, exc_info=True)
     try:
-        await message.channel.send(
-            _format_repost(message.author.mention, extra_text, blocks),
-            files=files,
-            allowed_mentions=discord.AllowedMentions.all(),
+        async with session.get(url, allow_redirects=True, headers=headers) as resp:
+            return str(resp.url)
+    except Exception:
+        log.warning("GET resolve failed for %s", url, exc_info=True)
+        return None
+
+
+async def rewrite_one(url: str, session: aiohttp.ClientSession) -> Optional[str]:
+    try:
+        current = url
+        if needs_resolve(url):
+            resolved = await resolve_redirect(session, url)
+            if not resolved:
+                return None
+            current = resolved
+        return rewrite_resolved(current)
+    except Exception:
+        log.exception("Rewrite failed for %s", url)
+        return None
+
+
+# ---- Discord client ----------------------------------------------------------
+
+class Embedder(discord.Client):
+    def __init__(self) -> None:
+        intents = discord.Intents.default()
+        intents.message_content = True
+        super().__init__(intents=intents)
+        self.http_session: Optional[aiohttp.ClientSession] = None
+        self.allowed_guilds = parse_allowed_guilds(os.getenv("ALLOWED_GUILD_IDS"))
+        self._webhooks: Dict[int, discord.Webhook] = {}
+        self._seen: OrderedDict[int, None] = OrderedDict()
+
+    async def setup_hook(self) -> None:
+        self.http_session = aiohttp.ClientSession(timeout=HTTP_TIMEOUT)
+
+    async def close(self) -> None:
+        if self.http_session and not self.http_session.closed:
+            await self.http_session.close()
+        await super().close()
+
+    def _mark_seen(self, message_id: int) -> bool:
+        if message_id in self._seen:
+            return False
+        self._seen[message_id] = None
+        while len(self._seen) > MAX_SEEN:
+            self._seen.popitem(last=False)
+        return True
+
+    def _guild_allowed(self, message: discord.Message) -> bool:
+        if message.guild is None:
+            return False
+        if self.allowed_guilds is None:
+            return True
+        return message.guild.id in self.allowed_guilds
+
+    async def on_ready(self) -> None:
+        guilds = ", ".join(f"{g.name} ({g.id})" for g in self.guilds) or "(none)"
+        allow = (
+            "all guilds"
+            if self.allowed_guilds is None
+            else f"allowlist {sorted(self.allowed_guilds)}"
         )
-    finally:
+        log.info("Logged in as %s — %s — %s", self.user, allow, guilds)
+
+    async def on_message(self, message: discord.Message) -> None:
+        await self._process_message(message)
+
+    async def on_message_edit(self, before: discord.Message, after: discord.Message) -> None:
+        if before.content == after.content:
+            return
+        await self._process_message(after)
+
+    async def _process_message(self, message: discord.Message) -> None:
+        if message.author.bot or message.webhook_id:
+            return
+        if not self._guild_allowed(message):
+            return
+        if message.id in self._seen:
+            return
+
+        content = message.content or ""
+        found = URL_RE.findall(content)
+        if not found:
+            return
+
+        session = self.http_session
+        if session is None or session.closed:
+            log.error("HTTP session is not available")
+            return
+
+        unique: List[str] = list(dict.fromkeys(found))
+        mirrors = await asyncio.gather(*(rewrite_one(url, session) for url in unique))
+        replacements = [
+            (original, mirror)
+            for original, mirror in zip(unique, mirrors)
+            if mirror
+        ]
+        if not replacements:
+            return
+
+        rewritten = apply_rewrites(content, replacements)
+        if rewritten == content:
+            return
+
+        if not self._mark_seen(message.id):
+            return
+
+        try:
+            posted = await self._repost(message, rewritten)
+        except Exception:
+            self._seen.pop(message.id, None)
+            log.exception("Failed to repost message %s", message.id)
+            return
+
+        if posted is None:
+            self._seen.pop(message.id, None)
+            return
+
+        await self._delete_original(message)
+
+    async def _collect_files(self, message: discord.Message) -> List[discord.File]:
+        files: List[discord.File] = []
+        for attachment in message.attachments[:MAX_FILES]:
+            try:
+                files.append(await attachment.to_file(spoiler=attachment.is_spoiler()))
+            except Exception:
+                log.warning(
+                    "Could not copy attachment %s on message %s",
+                    attachment.filename,
+                    message.id,
+                    exc_info=True,
+                )
+        return files
+
+    async def _get_webhook(self, channel: discord.abc.GuildChannel) -> discord.Webhook:
+        cached = self._webhooks.get(channel.id)
+        if cached:
+            return cached
+
+        existing = await channel.webhooks()
+        # User-created incoming webhooks usually omit Discord's APP badge.
+        # Bot-created ones always show it. discord.py's Webhook may not
+        # expose application_id, so ownership is used instead.
+        chosen = None
+        bot_owned = None
+        me = self.user
+        for hook in existing:
+            if hook.token is None:
+                continue
+            owner_id = hook.user.id if hook.user is not None else None
+            is_ours = me is not None and owner_id == me.id
+            if not is_ours:
+                chosen = hook
+                break
+            if bot_owned is None:
+                bot_owned = hook
+
+        if chosen is None:
+            chosen = bot_owned
+        if chosen is None:
+            chosen = await channel.create_webhook(
+                name=WEBHOOK_NAME,
+                reason="Repost rewritten social embeds as the original author",
+            )
+        self._webhooks[channel.id] = chosen
+        return chosen
+
+    async def _repost(self, message: discord.Message, content: str) -> Optional[discord.Message]:
+        channel = message.channel
+        thread: Optional[discord.Thread] = None
+        hook_channel: Optional[discord.abc.GuildChannel] = None
+
+        if isinstance(channel, discord.Thread):
+            thread = channel
+            hook_channel = channel.parent
+        elif isinstance(channel, discord.abc.GuildChannel):
+            hook_channel = channel
+
+        if hook_channel is None or not hasattr(hook_channel, "webhooks"):
+            log.warning("No webhook channel for message %s; leaving original", message.id)
+            return None
+
+        for _attempt in range(2):
+            files = await self._collect_files(message)
+            try:
+                webhook = await self._get_webhook(hook_channel)
+                sent = await self._webhook_send(
+                    webhook,
+                    content=content,
+                    username=message.author.display_name,
+                    avatar_url=message.author.display_avatar.url,
+                    files=files,
+                    thread=thread,
+                )
+                if sent is not None:
+                    return sent
+                self._webhooks.pop(hook_channel.id, None)
+            except (discord.Forbidden, discord.HTTPException) as exc:
+                log.warning("Webhook send failed (%s); leaving original message", exc)
+                self._webhooks.pop(hook_channel.id, None)
+                return None
+
+        return None
+
+    async def _webhook_send(
+        self,
+        webhook: discord.Webhook,
+        *,
+        content: str,
+        username: str,
+        avatar_url: str,
+        files: List[discord.File],
+        thread: Optional[discord.Thread],
+    ) -> Optional[discord.Message]:
+        kwargs: dict = {
+            "content": content,
+            "username": username,
+            "avatar_url": avatar_url,
+            "allowed_mentions": discord.AllowedMentions.none(),
+            "wait": True,
+        }
+        if files:
+            kwargs["files"] = files
+        if thread is not None:
+            kwargs["thread"] = thread
+
+        try:
+            return await webhook.send(**kwargs)
+        except discord.NotFound:
+            channel_id = webhook.channel_id
+            if channel_id:
+                self._webhooks.pop(channel_id, None)
+            log.info("Cached webhook was deleted; recreating")
+            return None
+
+    async def _delete_original(self, message: discord.Message) -> None:
         try:
             await message.delete()
-        except Exception:
-            # Missing perms or race with moderation/author deletion → ignore.
-            pass
+        except discord.HTTPException:
+            log.warning(
+                "Could not delete original message %s (missing Manage Messages?)",
+                message.id,
+            )
 
-# ---- Cleanup -----------------------------------------------------------------
 
-async def _cleanup_session():
-    """Close the shared aiohttp session on shutdown."""
-    global session
-    if session and not session.closed:
-        await session.close()
+def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        stream=sys.stdout,
+        force=True,
+    )
+    load_dotenv()
+    token = (os.getenv("DISCORD_TOKEN") or "").strip().strip("\"'")
+    if not token:
+        log.error("DISCORD_TOKEN is not set")
+        raise SystemExit(1)
 
-import atexit, asyncio
-atexit.register(lambda: asyncio.run(_cleanup_session()))
+    try:
+        parse_allowed_guilds(os.getenv("ALLOWED_GUILD_IDS"))
+    except ValueError:
+        log.error("ALLOWED_GUILD_IDS must be a comma-separated list of integers")
+        raise SystemExit(1)
 
-client.run(TOKEN)
+    client = Embedder()
+    try:
+        # log_handler=None: use the root handler above so journald gets a single stream.
+        client.run(token, log_handler=None)
+    except discord.LoginFailure:
+        log.error(
+            "Discord rejected the bot token. Open the Developer Portal, "
+            "Bot tab, reset the token, and paste the full value into .env "
+            "as DISCORD_TOKEN=... with no quotes or spaces."
+        )
+        raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    main()

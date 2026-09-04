@@ -1,0 +1,17 @@
+[Unit]
+Description=Discord Embedder
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%i
+WorkingDirectory=/home/%i/discord-embedder
+EnvironmentFile=/home/%i/discord-embedder/.env
+ExecStart=/home/%i/discord-embedder/.venv/bin/python bot.py
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

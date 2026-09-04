@@ -1,71 +1,113 @@
 # Discord Embedder
 
-Watches every message, converts links from common social sites to cleaner mirror URLs, reposts, and deletes the original. Attachments are preserved.
+Private bot for a friends server. It watches messages, rewrites social links to
+mirrors that Discord can actually embed, and replaces the message with the same
+text and attachments so it still looks like the original author sent it.
 
-> This is a private project I made for me and my friends. If you want to use it, please create your own Discord bot and run it on your own server.
+Discord does not allow bots to edit another user's message. The bot deletes the
+original and sends a webhook copy with that user's name and avatar, with only
+the URLs rewritten. It does not ping, DM, react, or otherwise talk to users.
 
-## What it does
+## Mirrors
 
-* Detects links in any message
-* Rewrites to better-embed mirrors
-* Reposts with masked “Original” and “Embed” labels
-* Carries over attachments
-* Resolves Instagram /share/* to canonical /p|/reel|/tv/... before mirroring
+* Twitter/X → `fixupx.com`
+* Instagram → `oginstagram.com`
+* Reddit → `rxddit.com`
+* TikTok → `vxtiktok.com`
+* Bluesky → `bskx.app`
 
-## Demo
-https://github.com/user-attachments/assets/a08744c2-5e67-4844-99a6-89147e299a36
-
-
-https://github.com/user-attachments/assets/cdda6e67-852a-4b55-a9f5-808339c6fcfb
-
-
-https://github.com/user-attachments/assets/237f2456-a0bf-469a-9891-78c495be8104
-
-
-
-## Mirrors used
-
-* Twitter/X → fixupx.com
-* Instagram → kkinstagram.com
-* Reddit → rxddit.com
-* TikTok → vxtiktok.com
-* Bluesky → bskx.app
-
-You can edit the map in DEFAULT_MIRRORS inside bot.py.
+Instagram `/share/*` links are resolved to a canonical `/p`, `/reel`, `/reels`,
+or `/tv` URL first. TikTok short links (`vm.tiktok.com`, `vt.tiktok.com`) are
+resolved the same way. Stories are mirrored; profile-only Instagram URLs are left
+alone.
 
 ## Requirements
+
 * Python 3.10+
-* A Discord bot token in .env as DISCORD_TOKEN=...
-* Message Content intent enabled for your app in the Developer Portal and in code (intents.message_content = True). 
+* A Discord bot token
+* **Message Content** intent enabled in the Developer Portal
+* Channel permissions: View Channel, Send Messages, Embed Links, Attach Files,
+  Read Message History, **Manage Messages**, **Manage Webhooks**
+* Optional: create a channel webhook yourself (Edit Channel → Integrations →
+  Webhooks) if you want to avoid Discord's **APP** badge. Bot-created webhooks
+  always show it; Discord does not let apps hide that label.
 
-## Setup (self-host)
+## Setup
 
-This repo is not a hosted service. If you want to use it, make your own bot and run it yourself.
+```bash
+git clone https://github.com/Raffiesaurus/discord-embedder.git
+cd discord-embedder
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env
+```
 
-* Create a Discord application and bot, then get your token. 
-* Enable the Message Content privileged intent for the app. 
-* Clone the repo, create a virtualenv, install deps, and set your .env:
+Edit `.env`:
 
-## Configuration
-.env
 ```
 DISCORD_TOKEN=your_bot_token
+# Optional. Restrict to specific servers:
+# ALLOWED_GUILD_IDS=123456789012345678
+```
+
+Invite the bot to the server with the permissions above, then either run it
+once:
+
+```bash
+python bot.py
+```
+
+or install it as a systemd service (below).
+
+## Ubuntu systemd service
+
+This assumes the repo lives at `~/discord-embedder` and the venv is `.venv`.
+
+```bash
+sudo cp deploy/discord-embedder@.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now discord-embedder@$USER
+journalctl -u discord-embedder@$USER -f
+```
+
+If the project is not in `/home/$USER/discord-embedder`, edit the copied unit
+and change `WorkingDirectory`, `EnvironmentFile`, and `ExecStart`.
+
+Useful commands:
+
+```bash
+sudo systemctl restart discord-embedder@$USER
+sudo systemctl status discord-embedder@$USER
 ```
 
 ## How it works
 
-* Regex finds URLs in the message.
-* If the host is known, swap to the mirror. For Instagram: 
-  * resolve /share/* to canonical
-  * skip stories
+1. Regex finds URLs in a guild message (DMs are ignored).
+2. Known hosts are swapped to their mirror; share/short links are followed first.
+3. Tracking query params are stripped.
+4. The original wording and attachments are kept, with only the URLs replaced.
+5. A webhook re-posts as the author, then the original is deleted. If the
+   webhook cannot be used, the original message is left alone.
 
-## Notes / limitations
-* Only public content embeds cleanly.
-* If a site changes its markup or blocks fetching, the bot still posts the mirrored link.
-* This project doesn’t store messages; it just reads, rewrites, and reposts.
+Edits are handled too: adding a social link later still gets rewritten.
 
-## Contributing
-No public support. Fork it and make your own tweaks.
+## Tests
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+## Notes
+
+* Only public posts embed reliably.
+* If a mirror is down, Discord will show a bad/empty embed; the rewritten link
+  is still posted.
+* Webhook copies from a **bot-created** webhook show Discord's APP badge; that
+  cannot be hidden. Create a webhook in the channel's Integrations settings and
+  the bot will use it instead, which usually has no APP label.
+* The bot never stores messages and never pings, DMs, or reacts.
 
 ## License
+
 Personal project. If you fork, add your own license file.
