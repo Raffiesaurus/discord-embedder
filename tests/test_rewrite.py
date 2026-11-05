@@ -99,7 +99,7 @@ class RewriteResolvedTests(unittest.TestCase):
         self.assertFalse(is_instagram_embeddable("/share/reel/AbC"))
         self.assertFalse(is_instagram_embeddable("/someone/"))
 
-    def test_reddit_tiktok_bsky(self) -> None:
+    def test_reddit_and_bsky(self) -> None:
         self.assertEqual(
             rewrite_resolved("https://www.reddit.com/r/foo/comments/abc/title/"),
             "https://rxddit.com/r/foo/comments/abc/title/",
@@ -109,17 +109,35 @@ class RewriteResolvedTests(unittest.TestCase):
             "https://rxddit.com/r/foo/comments/abc/title/",
         )
         self.assertEqual(
-            rewrite_resolved("https://www.tiktok.com/@user/video/123"),
-            "https://vxtiktok.com/@user/video/123",
-        )
-        self.assertEqual(
             rewrite_resolved("https://bsky.app/profile/user.bsky.social/post/abc"),
             "https://bskx.app/profile/user.bsky.social/post/abc",
+        )
+
+    def test_tiktok(self) -> None:
+        self.assertEqual(
+            rewrite_resolved("https://www.tiktok.com/@user/video/123"),
+            "https://tiktokfix.com/@user/video/123",
+        )
+        self.assertEqual(
+            rewrite_resolved("https://vxtiktok.com/@user/video/123"),
+            "https://tiktokfix.com/@user/video/123",
+        )
+        self.assertEqual(
+            rewrite_resolved("https://www.vxtiktok.com/@user/video/123"),
+            "https://tiktokfix.com/@user/video/123",
+        )
+        self.assertEqual(
+            rewrite_resolved("https://d.vxtiktok.com/@user/video/123"),
+            "https://tiktokfix.com/@user/video/123",
         )
 
     def test_skip_already_mirrored(self) -> None:
         self.assertTrue(is_skipped_host("fixupx.com"))
         self.assertTrue(is_skipped_host("www.fixupx.com"))
+        self.assertTrue(is_skipped_host("tiktokfix.com"))
+        self.assertTrue(is_skipped_host("a.tiktokfix.com"))
+        self.assertTrue(is_skipped_host("cdn.tiktokfix.com"))
+        self.assertIsNone(rewrite_resolved("https://tiktokfix.com/@user/video/123"))
         self.assertTrue(is_skipped_host("oginstagram.com"))
         self.assertTrue(is_skipped_host("g.oginstagram.com"))
         self.assertTrue(is_skipped_host("d.oginstagram.com"))
@@ -192,7 +210,7 @@ class ResolveTests(unittest.TestCase):
         result = asyncio.run(
             rewrite_one("https://vm.tiktok.com/ZSabcde/", session)  # type: ignore[arg-type]
         )
-        self.assertEqual(result, "https://vxtiktok.com/@user/video/999")
+        self.assertEqual(result, "https://tiktokfix.com/@user/video/999")
 
 
 class ConfigTests(unittest.TestCase):

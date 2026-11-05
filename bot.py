@@ -39,7 +39,7 @@ DEFAULT_MIRRORS: Dict[str, str] = {
     "x.com": "fixupx.com",
     "instagram.com": "oginstagram.com",
     "reddit.com": "vxreddit.com",
-    "tiktok.com": "vxtiktok.com",
+    "tiktok.com": "tiktokfix.com",
     "bsky.app": "bskx.app",
 }
 
@@ -52,7 +52,7 @@ SKIP_HOSTS = {
     "oginstagram.com",
     "vxreddit.com",
     "rxeddit.com",
-    "vxtiktok.com",
+    "tiktokfix.com",
     "bskx.app",
     "bskyx.app",
 }
@@ -141,6 +141,8 @@ def pick_source(host: Optional[str]) -> Optional[str]:
     if h == "reddit.com" or h.endswith(".reddit.com"):
         return "reddit.com"
     if h == "tiktok.com" or h.endswith(".tiktok.com"):
+        return "tiktok.com"
+    if h == "vxtiktok.com" or h.endswith(".vxtiktok.com"):
         return "tiktok.com"
     if h == "bsky.app" or h.endswith(".bsky.app"):
         return "bsky.app"

@@ -17,7 +17,7 @@ logged.
 * Twitter/X → `fixupx.com`
 * Instagram → `oginstagram.com`
 * Reddit → `rxddit.com`
-* TikTok → `vxtiktok.com`
+* TikTok → `tiktokfix.com`
 * Bluesky → `bskx.app`
 
 Instagram `/share/*` links are resolved to a canonical `/p`, `/reel`, `/reels`,
